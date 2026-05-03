@@ -1,0 +1,13 @@
+runner/node_modules/
+.env-state.json
+reports/
+
+tests/**
+!tests/example/
+!tests/example/**
+
+collections/**
+!collections/example*
+
+environments/**
+!environments/example*

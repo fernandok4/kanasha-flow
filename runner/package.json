@@ -1,0 +1,13 @@
+{
+  "name": "kanasha-api-test-runner",
+  "version": "1.0.0",
+  "description": "Flow-based API test runner for Kanasha services",
+  "main": "runner.js",
+  "scripts": {
+    "flow": "node runner.js"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "newman": "^6.1.3"
+  }
+}

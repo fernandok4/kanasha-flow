@@ -1,0 +1,9 @@
+name: "Example — GET google.com.br"
+description: Verifica que google.com.br responde com 200.
+stop_on_failure: true
+
+steps:
+  - name: "GET Homepage"
+    collection: example
+    folder: "Google"
+    request: "GET Homepage"
