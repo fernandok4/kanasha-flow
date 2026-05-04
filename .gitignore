@@ -1,6 +1,7 @@
 runner/node_modules/
 .env-state.json
 reports/
+custom_scripts/
 
 tests/**
 !tests/example/
