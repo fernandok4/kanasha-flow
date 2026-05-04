@@ -12,14 +12,15 @@ EXTRA_FLAGS=""
 for arg in "$@"; do
   [ "$arg" = "--report" ] && EXTRA_FLAGS="$EXTRA_FLAGS --report"
   [ "$arg" = "--auto"   ] && EXTRA_FLAGS="$EXTRA_FLAGS --auto"
+  [ "$arg" = "--junit"  ] && EXTRA_FLAGS="$EXTRA_FLAGS --junit"
 done
 
 if [ -z "$TEST" ]; then
-  echo "Usage: run-test.sh <path/to/test.yml> [environment] [--auto] [--report]"
+  echo "Usage: run-test.sh <path/to/test.yml> [environment] [--auto] [--report] [--junit]"
   echo ""
   echo "Exemplos:"
   echo "  run-test.sh auth/login-success.yml"
-  echo "  run-test.sh auth/login-success.yml local --report"
+  echo "  run-test.sh auth/login-success.yml local --report --junit"
   echo ""
   echo "Testes disponíveis:"
   find "$ROOT_DIR/tests" -name "*.yml" | sed "s|$ROOT_DIR/tests/||" | sort
