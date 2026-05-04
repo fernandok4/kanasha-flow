@@ -6,8 +6,7 @@ const yaml   = require('js-yaml');
 const fs     = require('fs');
 const path   = require('path');
 
-const ROOT       = path.resolve(__dirname, '..');
-const STATE_FILE = path.join(ROOT, '.env-state.json');
+const ROOT = path.resolve(__dirname, '..');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -35,13 +34,8 @@ function loadEnvironment(name) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function loadState() {
-  return fs.existsSync(STATE_FILE) ? JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')) : {};
-}
-
-function saveState(vars) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(vars, null, 2));
-}
+function loadState() { return {}; }
+function saveState()  {}
 
 function resolveVars(str, vars) {
   if (typeof str !== 'string') return str;
@@ -56,13 +50,12 @@ function findRequest(collection, folderName, requestName) {
     const available = folder.item.map(i => i.name).join(', ');
     throw new Error(`Request "${requestName}" not found in folder "${folderName}". Available: ${available}`);
   }
-  return JSON.parse(JSON.stringify(req)); // deep clone
+  return JSON.parse(JSON.stringify(req));
 }
 
 function applyBodyOverride(request, overrides, vars) {
   if (!overrides || !request.request.body) return;
   let raw = request.request.body.raw || '{}';
-  // resolve {{vars}} in the existing body first
   raw = resolveVars(raw, vars);
   const body = JSON.parse(raw);
   for (const [key, value] of Object.entries(overrides)) {
@@ -81,6 +74,38 @@ function mergeEnvFromSummary(summary, vars) {
     if (m.value !== undefined && m.value !== '') {
       vars[m.key] = m.value;
     }
+  }
+}
+
+// ─── validation ──────────────────────────────────────────────────────────────
+
+function validateFlow(flow, flowPath) {
+  const errors = [];
+
+  if (!flow.name || typeof flow.name !== 'string')
+    errors.push('"name" is required and must be a string');
+  if (!Array.isArray(flow.steps) || flow.steps.length === 0)
+    errors.push('"steps" is required and must be a non-empty array');
+
+  const validateSteps = (steps, label) => {
+    steps.forEach((step, i) => {
+      const ctx = `${label}[${i}]`;
+      if (step.type === 'human-input') {
+        if (!step.store) errors.push(`${ctx}: human-input step requires "store"`);
+      } else {
+        if (!step.collection) errors.push(`${ctx}: missing "collection"`);
+        if (!step.folder)     errors.push(`${ctx}: missing "folder"`);
+        if (!step.request)    errors.push(`${ctx}: missing "request"`);
+      }
+    });
+  };
+
+  if (Array.isArray(flow.steps))    validateSteps(flow.steps,    'steps');
+  if (Array.isArray(flow.setup))    validateSteps(flow.setup,    'setup');
+  if (Array.isArray(flow.teardown)) validateSteps(flow.teardown, 'teardown');
+
+  if (errors.length > 0) {
+    throw new Error(`Invalid flow "${flowPath}":\n${errors.map(e => `  • ${e}`).join('\n')}`);
   }
 }
 
@@ -106,7 +131,6 @@ async function runHumanInputStep(step, vars) {
   console.log(`     ${store} = ${value}`);
   return { passed: 1, failed: 0 };
 }
-
 
 function runRequestStep(step, vars, collections) {
   const { collection: collName, folder, request: reqName, body_override, extract } = step;
@@ -165,46 +189,14 @@ function runRequestStep(step, vars, collections) {
   });
 }
 
-// ─── flow runner ─────────────────────────────────────────────────────────────
+// ─── phase runner ────────────────────────────────────────────────────────────
 
-function flowHasHumanInput(flowFile) {
-  const flowPath = path.isAbsolute(flowFile)
-    ? flowFile
-    : path.join(ROOT, 'tests', flowFile);
-  if (!fs.existsSync(flowPath)) return false;
-  const flow = yaml.load(fs.readFileSync(flowPath, 'utf8'));
-  return (flow.steps || []).some(s => s.type === 'human-input');
-}
-
-async function runFlow(flowFile, envName = 'local') {
-  const flowPath = path.isAbsolute(flowFile)
-    ? flowFile
-    : path.join(ROOT, 'tests', flowFile);
-
-  if (!fs.existsSync(flowPath)) throw new Error(`Flow file not found: ${flowPath}`);
-
-  const flow = yaml.load(fs.readFileSync(flowPath, 'utf8'));
-
-  console.log(`\n${'═'.repeat(62)}`);
-  console.log(` 🧪 ${flow.name}`);
-  if (flow.description) console.log(` ${flow.description}`);
-  console.log('═'.repeat(62));
-
-  // Build env: environment file + persisted state
-  const env = loadEnvironment(envName);
-  const vars = {};
-  for (const v of env.values) {
-    if (v.enabled && v.value !== '') vars[v.key] = v.value;
-  }
-  Object.assign(vars, loadState());
-
-  const collections = loadAllCollections();
-
+async function runPhase(steps, vars, collections, stopOnFailure) {
   let totalPassed = 0;
   let totalFailed = 0;
   const stepResults = [];
 
-  for (const step of flow.steps) {
+  for (const step of steps) {
     const label = step.name || `${step.folder} / ${step.request}`;
     process.stdout.write(`\n  ▶ ${label}\n`);
 
@@ -219,27 +211,100 @@ async function runFlow(flowFile, envName = 'local') {
       console.log(`     ${ok ? '✓ passed' : '✗ failed'} (${result.passed} assertions)`);
       stepResults.push({ step: label, ok, passed: result.passed, failed: result.failed });
 
-      if (result.hasFailed && flow.stop_on_failure !== false) {
-        console.log(`\n  ⛔ Stopping flow — step failed and stop_on_failure is enabled`);
+      if (result.hasFailed && stopOnFailure) {
+        console.log(`\n  ⛔ Stopping — step failed and stop_on_failure is enabled`);
         break;
       }
     } catch (e) {
       totalFailed++;
       console.log(`     ✗ ERROR: ${e.message}`);
       stepResults.push({ step: label, ok: false, error: e.message });
-      if (flow.stop_on_failure !== false) {
-        console.log(`\n  ⛔ Stopping flow — unhandled error`);
+      if (stopOnFailure) {
+        console.log(`\n  ⛔ Stopping — unhandled error`);
         break;
       }
     }
   }
 
-  // Persist state for subsequent flows
+  return { totalPassed, totalFailed, stepResults };
+}
+
+// ─── flow runner ─────────────────────────────────────────────────────────────
+
+function flowHasHumanInput(flowFile) {
+  const flowPath = path.isAbsolute(flowFile)
+    ? flowFile
+    : path.join(ROOT, 'tests', flowFile);
+  if (!fs.existsSync(flowPath)) return false;
+  const flow = yaml.load(fs.readFileSync(flowPath, 'utf8'));
+  const all = [...(flow.steps || []), ...(flow.setup || []), ...(flow.teardown || [])];
+  return all.some(s => s.type === 'human-input');
+}
+
+async function runFlow(flowFile, envName = 'local') {
+  const flowPath = path.isAbsolute(flowFile)
+    ? flowFile
+    : path.join(ROOT, 'tests', flowFile);
+
+  if (!fs.existsSync(flowPath)) throw new Error(`Flow file not found: ${flowPath}`);
+
+  const flow = yaml.load(fs.readFileSync(flowPath, 'utf8'));
+  validateFlow(flow, flowPath);
+
+  console.log(`\n${'═'.repeat(62)}`);
+  console.log(` 🧪 ${flow.name}`);
+  if (flow.description) console.log(` ${flow.description}`);
+  console.log('═'.repeat(62));
+
+  const env = loadEnvironment(envName);
+  const vars = {};
+  for (const v of env.values) {
+    if (v.enabled && v.value !== '') vars[v.key] = v.value;
+  }
+  Object.assign(vars, loadState());
+
+  const collections = loadAllCollections();
+  const stopOnFailure = flow.stop_on_failure !== false;
+
+  let setupResults    = { totalPassed: 0, totalFailed: 0, stepResults: [] };
+  let mainResults     = { totalPassed: 0, totalFailed: 0, stepResults: [] };
+  let teardownResults = { totalPassed: 0, totalFailed: 0, stepResults: [] };
+
+  if (flow.setup?.length) {
+    console.log(`\n${'·'.repeat(62)}`);
+    console.log(`  SETUP`);
+    setupResults = await runPhase(flow.setup, vars, collections, true);
+  }
+
+  if (setupResults.totalFailed === 0) {
+    mainResults = await runPhase(flow.steps, vars, collections, stopOnFailure);
+  } else {
+    console.log(`\n  ⛔ Setup failed — skipping main steps`);
+  }
+
+  if (flow.teardown?.length) {
+    console.log(`\n${'·'.repeat(62)}`);
+    console.log(`  TEARDOWN`);
+    teardownResults = await runPhase(flow.teardown, vars, collections, false);
+    if (teardownResults.totalFailed > 0) {
+      console.log(`\n  ⚠️  ${teardownResults.totalFailed} teardown step(s) failed — not counted as test failures`);
+    }
+  }
+
   saveState(vars);
+
+  const totalPassed = setupResults.totalPassed + mainResults.totalPassed;
+  const totalFailed = setupResults.totalFailed + mainResults.totalFailed;
 
   console.log(`\n${'─'.repeat(62)}`);
   console.log(` ✅ ${totalPassed} passed   ❌ ${totalFailed} failed`);
   console.log('─'.repeat(62));
+
+  const stepResults = [
+    ...setupResults.stepResults.map(s => ({ ...s, phase: 'setup' })),
+    ...mainResults.stepResults,
+    ...teardownResults.stepResults.map(s => ({ ...s, phase: 'teardown' })),
+  ];
 
   return { name: flow.name, description: flow.description, totalPassed, totalFailed, stepResults };
 }
@@ -256,14 +321,17 @@ function buildHtml(report) {
   const esc = s => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const allOk = report.summary.failed === 0;
 
-  const stepRows = steps => steps.map(s => `
+  const stepRows = steps => steps.map(s => {
+    const phaseTag = s.phase ? ` <span class="phase-tag ${s.phase}">${s.phase}</span>` : '';
+    return `
       <tr class="${s.ok ? '' : 'fail-row'}">
-        <td>${esc(s.step)}</td>
+        <td>${esc(s.step)}${phaseTag}</td>
         <td class="status ${s.ok ? 'ok' : 'ko'}">${s.ok ? '✓ passed' : '✗ failed'}</td>
         <td class="num">${s.passed ?? 0}</td>
         <td class="num">${s.failed ?? 0}</td>
         <td class="err">${esc(s.error ?? '')}</td>
-      </tr>`).join('');
+      </tr>`;
+  }).join('');
 
   const flowSections = report.flows
     ? report.flows.map(f => {
@@ -300,7 +368,6 @@ function buildHtml(report) {
     .badge.fail{background:#fee2e2;color:#b91c1c}
     .badge.info{background:#e2e8f0;color:#475569}
     main{padding:24px 32px;display:flex;flex-direction:column;gap:28px}
-    section{}
     .flow-title{font-size:1rem;font-weight:700;margin-bottom:4px}
     .flow-title.ok{color:#15803d}.flow-title.ko{color:#b91c1c}
     .flow-desc{font-size:.82rem;color:#64748b;margin-bottom:6px}
@@ -313,6 +380,9 @@ function buildHtml(report) {
     td.status.ko{color:#b91c1c;font-weight:600}
     td.num{text-align:right;width:70px}
     td.err{color:#b91c1c;font-size:.8rem}
+    .phase-tag{font-size:.7rem;padding:1px 6px;border-radius:3px;margin-left:6px;font-weight:600;text-transform:uppercase}
+    .phase-tag.setup{background:#dbeafe;color:#1d4ed8}
+    .phase-tag.teardown{background:#fef9c3;color:#854d0e}
     .footer{padding:14px 32px;font-size:.72rem;color:#94a3b8}
   </style>
 </head>
@@ -334,7 +404,36 @@ function buildHtml(report) {
 </html>`;
 }
 
-function saveReport(flowResult) {
+function buildJunit(report) {
+  const esc = s => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+  const testcases = (steps, suiteName) => steps
+    .filter(s => s.phase !== 'teardown')
+    .map(s => {
+      const attrs = `name="${esc(s.step)}" classname="${esc(suiteName)}" time="0"`;
+      if (s.ok) return `    <testcase ${attrs}/>`;
+      const msg = esc(s.error || 'assertion failed');
+      return `    <testcase ${attrs}>\n      <failure message="${msg}"/>\n    </testcase>`;
+    }).join('\n');
+
+  if (report.flows) {
+    const total    = report.flows.reduce((n, f) => n + f.steps.filter(s => s.phase !== 'teardown').length, 0);
+    const failures = report.summary.failed;
+    const suites   = report.flows.map(f => {
+      const fSteps = f.steps.filter(s => s.phase !== 'teardown');
+      return `  <testsuite name="${esc(f.name)}" tests="${fSteps.length}" failures="${f.summary.failed}" time="0">\n${testcases(f.steps, f.name)}\n  </testsuite>`;
+    }).join('\n');
+    return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuites name="${esc(report.name)}" tests="${total}" failures="${failures}" time="0">\n${suites}\n</testsuites>`;
+  }
+
+  const steps    = (report.steps || []).filter(s => s.phase !== 'teardown');
+  const failures = report.summary.failed;
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<testsuite name="${esc(report.name)}" tests="${steps.length}" failures="${failures}" time="0">\n${testcases(report.steps || [], report.name)}\n</testsuite>`;
+}
+
+function saveReport(flowResult, withJunit) {
   const dir = ensureReportsDir();
   const slug = flowResult.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
   const ts = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
@@ -352,9 +451,14 @@ function saveReport(flowResult) {
   fs.writeFileSync(`${base}.html`, buildHtml(data));
   console.log(`\n  📄 ${base}.json`);
   console.log(`  📄 ${base}.html`);
+
+  if (withJunit) {
+    fs.writeFileSync(`${base}.xml`, buildJunit(data));
+    console.log(`  📄 ${base}.xml`);
+  }
 }
 
-function saveCombinedReport(flowResults) {
+function saveCombinedReport(flowResults, withJunit) {
   const dir = ensureReportsDir();
   const ts = new Date().toISOString().slice(0, 16).replace(/[T:]/g, '-');
   const base = path.join(dir, `${ts}_all-flows`);
@@ -379,6 +483,11 @@ function saveCombinedReport(flowResults) {
   fs.writeFileSync(`${base}.html`, buildHtml(data));
   console.log(`\n  📄 ${base}.json`);
   console.log(`  📄 ${base}.html`);
+
+  if (withJunit) {
+    fs.writeFileSync(`${base}.xml`, buildJunit(data));
+    console.log(`  📄 ${base}.xml`);
+  }
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -393,7 +502,6 @@ async function runSingleRequest(collectionName, folderName, requestName, envName
   for (const v of env.values) {
     if (v.enabled && v.value !== '') vars[v.key] = v.value;
   }
-  Object.assign(vars, loadState());
 
   const collections = loadAllCollections();
 
@@ -429,24 +537,23 @@ async function main() {
   if (args.length === 0 || args[0] === '--help') {
     console.log(`
 Usage:
-  node runner.js <flow.yml> [environment] [--auto] [--report]
-  node runner.js --all [environment] [--auto] [--report]
+  node runner.js <flow.yml> [environment] [--auto] [--report] [--junit]
+  node runner.js --all [environment] [--auto] [--report] [--junit]
   node runner.js --request <collection> <folder> <request> [environment]
   node runner.js --list
 
-Examples:
-  node runner.js 01-setup.yml
-  node runner.js 01-setup.yml --report
-  node runner.js --all local
-  node runner.js --all --auto
-  node runner.js --all --auto --report
-  node runner.js --request authentication-service "OAuth2" "Get Company Token"
-  node runner.js --request communication-service "Challenges" "Validate Challenge - Success" local
-  node runner.js --list
-
 Flags:
-  --auto     Pula flows que contém steps human-input (apenas testes automatizados)
-  --report   Gera relatório JSON + HTML em reports/ após a execução
+  --auto     Skip flows that contain human-input steps (for CI/CD)
+  --report   Generate JSON + HTML report in reports/ after the run
+  --junit    Generate JUnit XML report in reports/ (for GitLab/GitHub CI)
+
+Examples:
+  node runner.js auth/login-success.yml
+  node runner.js auth/login-success.yml local --report --junit
+  node runner.js --all local
+  node runner.js --all --auto --junit
+  node runner.js --request authentication-service "OAuth2" "Get Company Token"
+  node runner.js --list
 `);
     process.exit(0);
   }
@@ -456,32 +563,9 @@ Flags:
     process.exit(0);
   }
 
-  if (args[0] === '--set') {
-    const [, key, value] = args;
-    if (!key || value === undefined) {
-      console.error('Usage: --set <key> <value>');
-      process.exit(1);
-    }
-    const state = loadState();
-    state[key] = value;
-    saveState(state);
-    console.log(`✓ ${key} = ${value}`);
-    process.exit(0);
-  }
-
-  if (args[0] === '--get') {
-    const state = loadState();
-    if (args[1]) {
-      const val = state[args[1]];
-      console.log(val !== undefined ? `${args[1]} = ${val}` : `${args[1]} não encontrado no estado`);
-    } else {
-      console.log(JSON.stringify(state, null, 2));
-    }
-    process.exit(0);
-  }
-
   if (args[0] === '--request') {
-    const [, collectionName, folderName, requestName, envName] = args;
+    const positional = args.slice(1).filter(a => !a.startsWith('--'));
+    const [collectionName, folderName, requestName, envName] = positional;
     if (!collectionName || !folderName || !requestName) {
       console.error('Usage: --request <collection> <folder> <request> [environment]');
       process.exit(1);
@@ -491,8 +575,9 @@ Flags:
   }
 
   const report   = args.includes('--report');
+  const junit    = args.includes('--junit');
   const autoOnly = args.includes('--auto');
-  const envName  = args.find(a => !a.startsWith('--') && !a.endsWith('.yml')) || 'local';
+  const envName  = args.find(a => !a.startsWith('--') && !a.endsWith('.yml') && a !== args[0]) || 'local';
 
   if (args[0] === '--all') {
     const testsDir = path.join(ROOT, 'tests');
@@ -523,7 +608,7 @@ Flags:
     console.log(` ALL FLOWS — ✅ ${grand.passed} passed   ❌ ${grand.failed} failed${skipped.length > 0 ? `   ⏭  ${skipped.length} skipped` : ''}`);
     console.log('═'.repeat(62));
 
-    if (report) saveCombinedReport(flowResults);
+    if (report || junit) saveCombinedReport(flowResults, junit);
 
     process.exit(grand.failed > 0 ? 1 : 0);
   }
@@ -534,7 +619,7 @@ Flags:
   }
 
   const result = await runFlow(args[0], envName);
-  if (report) saveReport(result);
+  if (report || junit) saveReport(result, junit);
   process.exit(result.totalFailed > 0 ? 1 : 0);
 }
 
