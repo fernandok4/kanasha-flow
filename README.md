@@ -198,6 +198,33 @@ Any combination of calls is a valid test:
 ./scripts/run-request.sh my-api "Roles" "List User Roles"
 ```
 
+### Bulk data import
+
+Scripts under `custom_scripts/` are one-off automation scripts for specific data operations. They are not part of the generic runner — each one is self-contained and handles its own login/token lifecycle.
+
+#### `import-mordi-search-keys.sh`
+
+Imports search keys in bulk from a JSON file into the mordi-service. Handles authentication automatically and refreshes the token every 200 records to avoid expiry on large imports.
+
+```bash
+# Default data file (data/mordi-search-keys-baixada-santista.json)
+./custom_scripts/import-mordi-search-keys.sh
+
+# Custom data file
+./custom_scripts/import-mordi-search-keys.sh /path/to/keys.json
+```
+
+Expected JSON format:
+
+```json
+[
+  { "text": "Praia Grande", "lat": -24.00, "lng": -46.41, "radiusMeters": 5000 },
+  ...
+]
+```
+
+Output shows per-record status (created / skipped / failed) and a final summary.
+
 ---
 
 ## Variable chaining
@@ -284,6 +311,7 @@ kanasha-flow/
 ├── tests/                        ← declarative YAML test scenarios
 │   └── example/
 │       └── get-google.yml
+├── data/                         ← input data files for bulk import scripts
 ├── reports/                      ← generated with --report (gitignored)
 │   └── YYYY-MM-DD_HH-mm_<flow>.[json|html]
 ├── runner/
@@ -293,6 +321,9 @@ kanasha-flow/
 │   ├── run-request.sh            ← run a single request
 │   ├── run-test.sh               ← run a full flow
 │   ├── run-all-tests.sh          ← run all flows in sequence
+│   ├── run-all.sh                ← run all services in sequence (calls per-service scripts)
 │   └── set-var.sh                ← manage state manually
+├── custom_scripts/
+│   └── import-mordi-search-keys.sh  ← bulk import search keys into mordi-service
 └── .env-state.json               ← state persisted between runs (gitignored)
 ```
