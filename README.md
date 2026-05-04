@@ -1,26 +1,24 @@
 # kanasha-flow
 
-A YAML-driven API test runner built on top of Postman collections. Chain requests, persist state across flows, and mix automated and interactive steps in a single tool.
+A YAML-driven API test runner built on top of Postman collections. Chain requests within a flow, validate YAML before running, and mix automated and interactive steps in a single tool.
 
-Postman **collections** define the available endpoints. The **runner** executes them, chains variables, and orchestrates scenarios.
+Postman **collections** define the available endpoints. The **runner** executes them, chains variables within a run, and orchestrates scenarios.
 
 > Project files (`collections/`, `environments/`, `tests/`) are gitignored. Files prefixed with `example` are the exception — copy, rename, and adapt them as your starting point.
 
 ## Why not plain Newman?
 
-If your tests are stateless — each run starts from scratch — Newman with a shell script is probably enough.
+If your tests are simple one-shot requests, Newman with a shell script is probably enough.
 
-kanasha-flow is built for a specific problem: **tests that have dependencies across separate runs**. The state persisted in `.env-state.json` is what makes it useful:
-
-- Set up your application on Monday, run auth tests on Tuesday — the IDs are still there
-- A login flow saves the token; the next flow uses it without logging in again
-- A human-input step pauses and waits for a code received by email or SMS — something Newman can't do at all
+kanasha-flow is built for a specific problem: **flows with multiple steps that depend on each other within the same run**. Each run starts from a clean state — reproducible by default, safe for CI.
 
 | | Plain Newman | kanasha-flow |
 |---|---|---|
-| Persist variables across separate runs | ✗ | ✓ via `.env-state.json` |
-| Chain flows with shared state | ✗ | ✓ |
+| Chain variables within a flow | ✗ | ✓ via `extract` + `body_override` |
+| Setup and teardown per flow | ✗ | ✓ |
 | Pause and prompt for user input (e.g. email/SMS code) | ✗ | ✓ via `human-input` |
+| YAML schema validation before running | ✗ | ✓ |
+| JUnit XML output for CI | ✗ | ✓ via `--junit` |
 
 Newman is still used under the hood — the runner calls it per individual request. What kanasha-flow adds is the orchestration layer on top.
 
@@ -37,21 +35,19 @@ collections/          environments/          tests/
                     ┌─────────────────────────────────┐
                     │            runner.js             │
                     │                                  │
-                    │  1. load environment             │
-                    │  2. merge with .env-state.json   │
-                    │  3. execute each step in order   │
+                    │  1. validate flow YAML           │
+                    │  2. load environment             │
+                    │  3. run setup steps              │
+                    │  4. execute steps in order       │
                     │     └─ call Newman per request   │
                     │     └─ extract variables         │
                     │     └─ pause for human-input     │
-                    │  4. save updated state           │
-                    │  5. generate report (--report)   │
+                    │  5. run teardown steps           │
+                    │  6. generate report (--report)   │
                     └─────────────────────────────────┘
-                                    │
-                          .env-state.json
-                        (persists between runs)
 ```
 
-Each run reads the previous state and writes the new one — so a token obtained in one flow is available in the next, even if they run at different times.
+Each run starts with a clean state — variables are scoped to the current run and not persisted between runs.
 
 ---
 
@@ -113,8 +109,8 @@ The `collection` name matches the JSON filename without the extension. `folder` 
 # All flows
 ./scripts/run-all-tests.sh
 
-# Automated tests only + report
-./scripts/run-all-tests.sh local --auto --report
+# CI/CD — skip human-input flows, emit JUnit XML
+./scripts/run-all-tests.sh local --auto --junit
 ```
 
 ---
@@ -154,6 +150,7 @@ Runs a sequence of requests declared in YAML, with automatic variable chaining a
 |------|-------------|
 | `--auto` | Skip flows that contain `human-input` steps — useful for CI/CD |
 | `--report` | Generate a JSON + HTML report in `reports/` after the run |
+| `--junit` | Generate a JUnit XML report in `reports/` (GitLab/GitHub CI integration) |
 
 Flags are combinable and work on both `run-test.sh` and `run-all-tests.sh`:
 
@@ -164,8 +161,22 @@ Flags are combinable and work on both `run-test.sh` and `run-all-tests.sh`:
 # With report
 ./scripts/run-test.sh auth/login-success.yml local --report
 
-# Combined
-./scripts/run-all-tests.sh local --auto --report
+# CI pipeline
+./scripts/run-all-tests.sh local --auto --junit
+```
+
+**`--junit`** generates `reports/<timestamp>_<flow>.xml` alongside the JSON and HTML files. Publish it in your CI pipeline:
+
+```yaml
+# GitLab CI
+artifacts:
+  reports:
+    junit: api-tests/reports/*.xml
+
+# GitHub Actions
+- uses: actions/upload-artifact@v4
+  with:
+    path: api-tests/reports/*.xml
 ```
 
 When `--auto` is used on a flow with `human-input` steps, the runner skips it and exits with code 0 (not counted as a failure):
@@ -174,18 +185,7 @@ When `--auto` is used on a flow with `human-input` steps, the runner skips it an
 ⏭  Skipping "onboarding/full-email-flow.yml" — contains human-input steps (--auto)
 ```
 
-Reports are saved in `reports/` with a timestamp in the filename (`YYYY-MM-DDTHH-mm_<flow>.json|html`) and are gitignored.
-
-### Manual state
-
-Set variables directly into the state without running a request.
-
-```bash
-./scripts/set-var.sh userId "258746a0-6caf-4bdd-8d13-743a42e3884c"
-./scripts/set-var.sh userEmail "user@example.com"
-./scripts/set-var.sh --get               # view full state
-./scripts/set-var.sh --get userId        # view a single variable
-```
+Reports are saved in `reports/` with a timestamp in the filename (`YYYY-MM-DDTHH-mm_<flow>.[json|html|xml]`) and are gitignored.
 
 ### Ad-hoc scenario
 
@@ -193,8 +193,6 @@ Any combination of calls is a valid test:
 
 ```bash
 ./scripts/run-request.sh my-api "OAuth2" "Get Token"
-./scripts/set-var.sh targetUserId "uuid-here"
-./scripts/run-request.sh my-api "Roles" "Assign Role"
 ./scripts/run-request.sh my-api "Roles" "List User Roles"
 ```
 
@@ -202,14 +200,12 @@ Any combination of calls is a valid test:
 
 ## Variable chaining
 
-State is built in layers — each run reads and writes to the same `.env-state.json`:
+Variables are scoped to the current run. Each run starts clean. The variable resolution order within a run:
 
 1. `environments/local.postman_environment.json` — base values (URLs, credentials, etc.)
-2. `.env-state.json` — state persisted from previous runs
-3. `pm.environment.set()` in collection test scripts — automatic after each request
-4. `extract` field in YAML — manual JSONPath extraction
-5. `human-input` steps — value typed by the user in the terminal
-6. `set-var.sh` — manual injection of any variable
+2. `pm.environment.set()` in collection test scripts — automatic after each request
+3. `extract` field in YAML — manual JSONPath extraction
+4. `human-input` steps — value typed by the user in the terminal
 
 ---
 
@@ -246,6 +242,40 @@ steps:
     store: challengeCode
 ```
 
+### Setup and teardown
+
+Use `setup` and `teardown` to make flows reproducible and self-cleaning:
+
+```yaml
+name: "Create and delete a user"
+stop_on_failure: true
+
+setup:
+  - name: "Login"
+    collection: authentication-service
+    folder: "Auth Flows"
+    request: "Login"
+
+steps:
+  - name: "Create user"
+    collection: my-api
+    folder: "Users"
+    request: "Create User"
+    extract:
+      createdUserId: "$.id"
+
+teardown:
+  - name: "Delete user"
+    collection: my-api
+    folder: "Users"
+    request: "Delete User"
+```
+
+- `setup` steps run before `steps`. If any setup step fails, `steps` are skipped entirely.
+- `teardown` steps run after `steps`, regardless of whether they passed or failed.
+- Teardown failures are logged but **do not affect the exit code** — their purpose is cleanup, not assertions.
+- Both `setup` and `teardown` accept the same step types as `steps`.
+
 ---
 
 ## Adding new tests
@@ -261,6 +291,7 @@ steps:
 Create `tests/<category>/name.yml` following the format above:
 - `stop_on_failure: true` — for flows where each step depends on the previous one
 - `stop_on_failure: false` — for error validation flows where steps are independent
+- Add `setup` / `teardown` to ensure the flow leaves no side effects in the environment
 
 ### New environment
 
@@ -293,7 +324,5 @@ kanasha-flow/
 │   ├── run-request.sh            ← run a single request
 │   ├── run-test.sh               ← run a full flow
 │   ├── run-all-tests.sh          ← run all flows in sequence
-│   ├── run-all.sh                ← run all services in sequence (calls per-service scripts)
-│   └── set-var.sh                ← manage state manually
-└── .env-state.json               ← state persisted between runs (gitignored)
+│   └── run-all.sh                ← run all services in sequence (calls per-service scripts)
 ```
