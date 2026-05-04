@@ -16,6 +16,7 @@ if [ -z "$COLLECTION" ] || [ -z "$FOLDER" ] || [ -z "$REQUEST" ]; then
   echo "Collections disponíveis:"
   echo "  authentication-service"
   echo "  communication-service"
+  echo "  mordi-service"
   echo ""
   echo "Para listar todos os requests disponíveis:"
   echo "  cd runner && node runner.js --list"
