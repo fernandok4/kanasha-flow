@@ -7,6 +7,7 @@ const fs     = require('fs');
 const path   = require('path');
 
 const ROOT = path.resolve(__dirname, '..');
+const STATE_FILE = path.join(ROOT, '.run-state.json');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -34,8 +35,23 @@ function loadEnvironment(name) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
-function loadState() { return {}; }
-function saveState()  {}
+function loadState() {
+  if (!fs.existsSync(STATE_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch { return {}; }
+}
+
+function saveState(vars) {
+  const existing = loadState();
+  const updated = { ...existing };
+  for (const [k, v] of Object.entries(vars)) {
+    if (v !== undefined && v !== '' && v !== null) updated[k] = v;
+  }
+  fs.writeFileSync(STATE_FILE, JSON.stringify(updated, null, 2));
+}
+
+function clearState() {
+  if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE);
+}
 
 function resolveVars(str, vars) {
   if (typeof str !== 'string') return str;
@@ -77,6 +93,18 @@ function mergeEnvFromSummary(summary, vars) {
   }
 }
 
+function extractFromRow(row, extracts, vars) {
+  if (!row || !extracts) return;
+  for (const [varName, jpPath] of Object.entries(extracts)) {
+    const key = jpPath.replace(/^\$\./, '');
+    const val = row[key];
+    if (val !== undefined && val !== null) {
+      vars[varName] = String(val);
+      console.log(`     ${varName} = ${val}`);
+    }
+  }
+}
+
 // ─── validation ──────────────────────────────────────────────────────────────
 
 function validateFlow(flow, flowPath) {
@@ -92,6 +120,9 @@ function validateFlow(flow, flowPath) {
       const ctx = `${label}[${i}]`;
       if (step.type === 'human-input') {
         if (!step.store) errors.push(`${ctx}: human-input step requires "store"`);
+      } else if (step.type === 'db-query') {
+        if (!step.connection) errors.push(`${ctx}: db-query step requires "connection"`);
+        if (!step.query)      errors.push(`${ctx}: db-query step requires "query"`);
       } else {
         if (!step.collection) errors.push(`${ctx}: missing "collection"`);
         if (!step.folder)     errors.push(`${ctx}: missing "folder"`);
@@ -132,6 +163,30 @@ async function runHumanInputStep(step, vars) {
   return { passed: 1, failed: 0 };
 }
 
+async function runDbQueryStep(step, vars) {
+  const { Client } = require('pg');
+  const { query: rawQuery, connection: rawConn, extract } = step;
+
+  const connStr = resolveVars(rawConn, vars);
+  const query   = resolveVars(rawQuery, vars);
+
+  const stmt = query.trim().toUpperCase();
+  if (!stmt.startsWith('SELECT') && !stmt.startsWith('WITH')) {
+    throw new Error('db-query only allows SELECT statements');
+  }
+
+  const client = new Client({ connectionString: connStr });
+  try {
+    await client.connect();
+    const result = await client.query(query);
+    const row = result.rows[0] || null;
+    extractFromRow(row, extract, vars);
+    return { passed: 1, failed: 0 };
+  } finally {
+    await client.end().catch(() => {});
+  }
+}
+
 function runRequestStep(step, vars, collections) {
   const { collection: collName, folder, request: reqName, body_override, extract } = step;
 
@@ -140,6 +195,15 @@ function runRequestStep(step, vars, collections) {
 
   const request = findRequest(collection, folder, reqName);
   if (body_override) applyBodyOverride(request, body_override, vars);
+
+  // Resolve relative file paths in formdata to absolute paths from project root
+  if (request.request?.body?.mode === 'formdata') {
+    for (const part of request.request.body.formdata || []) {
+      if (part.type === 'file' && part.src && !path.isAbsolute(part.src)) {
+        part.src = path.join(ROOT, part.src);
+      }
+    }
+  }
 
   const miniCollection = {
     info: { ...collection.info, name: `[flow] ${reqName}` },
@@ -150,6 +214,7 @@ function runRequestStep(step, vars, collections) {
     newman.run({
       collection: miniCollection,
       environment: { id: 'flow-env', values: buildEnvValues(vars) },
+      insecureFileRead: true,
       reporters: [],
       reporter: {}
     }, (err, summary) => {
@@ -191,6 +256,12 @@ function runRequestStep(step, vars, collections) {
 
 // ─── phase runner ────────────────────────────────────────────────────────────
 
+async function runStep(step, vars, collections) {
+  if (step.type === 'human-input') return runHumanInputStep(step, vars);
+  if (step.type === 'db-query')    return runDbQueryStep(step, vars);
+  return runRequestStep(step, vars, collections);
+}
+
 async function runPhase(steps, vars, collections, stopOnFailure) {
   let totalPassed = 0;
   let totalFailed = 0;
@@ -200,28 +271,39 @@ async function runPhase(steps, vars, collections, stopOnFailure) {
     const label = step.name || `${step.folder} / ${step.request}`;
     process.stdout.write(`\n  ▶ ${label}\n`);
 
+    const allowFailure = step.allow_failure === true;
+
     try {
-      const result = step.type === 'human-input'
-        ? await runHumanInputStep(step, vars)
-        : await runRequestStep(step, vars, collections);
+      const result = await runStep(step, vars, collections);
 
-      totalPassed += result.passed;
-      totalFailed += result.failed;
       const ok = !result.hasFailed && result.failed === 0;
-      console.log(`     ${ok ? '✓ passed' : '✗ failed'} (${result.passed} assertions)`);
-      stepResults.push({ step: label, ok, passed: result.passed, failed: result.failed });
 
-      if (result.hasFailed && stopOnFailure) {
-        console.log(`\n  ⛔ Stopping — step failed and stop_on_failure is enabled`);
-        break;
+      if (allowFailure && !ok) {
+        console.log(`     ⚠️  skipped (allow_failure) — ${result.passed} assertions`);
+        stepResults.push({ step: label, ok: true, passed: result.passed, failed: 0, skipped: true });
+      } else {
+        totalPassed += result.passed;
+        totalFailed += result.failed;
+        console.log(`     ${ok ? '✓ passed' : '✗ failed'} (${result.passed} assertions)`);
+        stepResults.push({ step: label, ok, passed: result.passed, failed: result.failed });
+
+        if (!ok && stopOnFailure) {
+          console.log(`\n  ⛔ Stopping — step failed and stop_on_failure is enabled`);
+          break;
+        }
       }
     } catch (e) {
-      totalFailed++;
-      console.log(`     ✗ ERROR: ${e.message}`);
-      stepResults.push({ step: label, ok: false, error: e.message });
-      if (stopOnFailure) {
-        console.log(`\n  ⛔ Stopping — unhandled error`);
-        break;
+      if (allowFailure) {
+        console.log(`     ⚠️  skipped (allow_failure) — ${e.message}`);
+        stepResults.push({ step: label, ok: true, passed: 0, failed: 0, skipped: true });
+      } else {
+        totalFailed++;
+        console.log(`     ✗ ERROR: ${e.message}`);
+        stepResults.push({ step: label, ok: false, error: e.message });
+        if (stopOnFailure) {
+          console.log(`\n  ⛔ Stopping — unhandled error`);
+          break;
+        }
       }
     }
   }
@@ -253,7 +335,7 @@ async function runFlow(flowFile, envName = 'local') {
 
   console.log(`\n${'═'.repeat(62)}`);
   console.log(` 🧪 ${flow.name}`);
-  if (flow.description) console.log(` ${flow.description}`);
+  if (flow.description) console.log(` ${flow.description.trim()}`);
   console.log('═'.repeat(62));
 
   const env = loadEnvironment(envName);
@@ -502,6 +584,7 @@ async function runSingleRequest(collectionName, folderName, requestName, envName
   for (const v of env.values) {
     if (v.enabled && v.value !== '') vars[v.key] = v.value;
   }
+  Object.assign(vars, loadState());
 
   const collections = loadAllCollections();
 
@@ -537,8 +620,8 @@ async function main() {
   if (args.length === 0 || args[0] === '--help') {
     console.log(`
 Usage:
-  node runner.js <flow.yml> [environment] [--auto] [--report] [--junit]
-  node runner.js --all [environment] [--auto] [--report] [--junit]
+  node runner.js <flow.yml> [environment] [--auto] [--report] [--junit] [--fresh]
+  node runner.js --all [environment] [--auto] [--report] [--junit] [--fresh]
   node runner.js --request <collection> <folder> <request> [environment]
   node runner.js --list
 
@@ -546,12 +629,14 @@ Flags:
   --auto     Skip flows that contain human-input steps (for CI/CD)
   --report   Generate JSON + HTML report in reports/ after the run
   --junit    Generate JUnit XML report in reports/ (for GitLab/GitHub CI)
+  --fresh    Clear persisted state before running (start from scratch)
 
 Examples:
   node runner.js auth/login-success.yml
   node runner.js auth/login-success.yml local --report --junit
   node runner.js --all local
   node runner.js --all --auto --junit
+  node runner.js --all --fresh --auto --junit
   node runner.js --request authentication-service "OAuth2" "Get Company Token"
   node runner.js --list
 `);
@@ -561,6 +646,12 @@ Examples:
   if (args[0] === '--list') {
     listRequests();
     process.exit(0);
+  }
+
+  const fresh = args.includes('--fresh');
+  if (fresh) {
+    clearState();
+    console.log('  🧹 State cleared (--fresh)');
   }
 
   if (args[0] === '--request') {

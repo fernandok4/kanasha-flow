@@ -12,3 +12,4 @@ collections/**
 
 environments/**
 !environments/example*
+.run-state.json

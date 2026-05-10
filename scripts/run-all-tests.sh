@@ -12,6 +12,7 @@ for arg in "$@"; do
   [ "$arg" = "--report" ] && EXTRA_FLAGS="$EXTRA_FLAGS --report"
   [ "$arg" = "--auto"   ] && EXTRA_FLAGS="$EXTRA_FLAGS --auto"
   [ "$arg" = "--junit"  ] && EXTRA_FLAGS="$EXTRA_FLAGS --junit"
+  [ "$arg" = "--fresh"  ] && EXTRA_FLAGS="$EXTRA_FLAGS --fresh"
 done
 
 echo "======================================"

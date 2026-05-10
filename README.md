@@ -109,8 +109,11 @@ The `collection` name matches the JSON filename without the extension. `folder` 
 # All flows
 ./scripts/run-all-tests.sh
 
-# CI/CD — skip human-input flows, emit JUnit XML
+# CI/CD — bootstrap + skip human-input flows, emit JUnit XML
 ./scripts/run-all-tests.sh local --auto --junit
+
+# Fresh start (clear persisted state, then run everything)
+./scripts/run-all-tests.sh local --fresh --auto --junit
 ```
 
 ---
@@ -151,6 +154,7 @@ Runs a sequence of requests declared in YAML, with automatic variable chaining a
 | `--auto` | Skip flows that contain `human-input` steps — useful for CI/CD |
 | `--report` | Generate a JSON + HTML report in `reports/` after the run |
 | `--junit` | Generate a JUnit XML report in `reports/` (GitLab/GitHub CI integration) |
+| `--fresh` | Clear persisted state (`.run-state.json`) before running — use for a clean start |
 
 Flags are combinable and work on both `run-test.sh` and `run-all-tests.sh`:
 
@@ -200,12 +204,21 @@ Any combination of calls is a valid test:
 
 ## Variable chaining
 
-Variables are scoped to the current run. Each run starts clean. The variable resolution order within a run:
+The variable resolution order within a run:
 
 1. `environments/local.postman_environment.json` — base values (URLs, credentials, etc.)
-2. `pm.environment.set()` in collection test scripts — automatic after each request
-3. `extract` field in YAML — manual JSONPath extraction
-4. `human-input` steps — value typed by the user in the terminal
+2. `.run-state.json` — persisted state from previous flows (see below)
+3. `pm.environment.set()` in collection test scripts — automatic after each request
+4. `extract` field in YAML — manual JSONPath extraction
+5. `human-input` steps — value typed by the user in the terminal
+
+### State persistence
+
+After each flow runs, all variables are persisted to `.run-state.json` (gitignored). When the next flow starts, this state is merged on top of the environment values — state takes precedence.
+
+This means the bootstrap flow can run once and set `applicationGroupId`, `applicationId`, `userAccessToken`, etc., and all subsequent flows pick them up without re-authenticating from scratch.
+
+Use `--fresh` to clear the state file and force a clean restart (e.g., after a database reset).
 
 ---
 
@@ -241,6 +254,35 @@ steps:
     prompt: "Type the 6-digit code received by email/SMS"
     store: challengeCode
 ```
+
+### Type: db-query
+
+Executes a read-only SQL `SELECT` against a PostgreSQL database. Useful for reading data that is not exposed via an API (e.g. NOOP challenge codes in test environments).
+
+```yaml
+  - name: "Get challenge code from DB"
+    type: db-query
+    connection: "{{dbCommunicationUrl}}"   # full postgresql:// connection string
+    query: "SELECT validation_code FROM tb_application_challenge WHERE external_id = '{{challengeId}}' LIMIT 1"
+    extract:
+      challengeCode: "$.validation_code"   # column name from first row
+```
+
+The `connection` string is resolved against the current environment variables, so it can reference `{{dbSomeServiceUrl}}` defined in your environment file.
+
+### allow_failure
+
+Any step (of any type) can be marked `allow_failure: true`. If the step fails its assertions or throws an error, it is logged as a warning (`⚠️`) and does not count toward the flow's failure count or trigger `stop_on_failure`.
+
+```yaml
+  - name: "Create Application Group"
+    collection: authentication-service
+    folder: "Application Groups"
+    request: "Create Application Group"
+    allow_failure: true   # silently skipped if it already exists (409)
+```
+
+This is the mechanism behind idempotent bootstrap flows.
 
 ### Setup and teardown
 
