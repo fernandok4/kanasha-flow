@@ -1,4 +1,4 @@
-# kanasha-flow — Agent Instructions
+# kanasha-flow — Claude Instructions
 
 Read the full contents of `README.md` before performing any task in this project.
 
