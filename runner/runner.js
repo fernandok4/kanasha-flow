@@ -58,6 +58,30 @@ function resolveVars(str, vars) {
   return str.replace(/\{\{(\w+)\}\}/g, (_, k) => (vars[k] !== undefined ? vars[k] : `{{${k}}}`));
 }
 
+function collectTemplateVars(value, names = new Set()) {
+  if (typeof value === 'string') {
+    for (const match of value.matchAll(/\{\{(\w+)\}\}/g)) names.add(match[1]);
+  } else if (Array.isArray(value)) {
+    value.forEach(item => collectTemplateVars(item, names));
+  } else if (value && typeof value === 'object') {
+    Object.values(value).forEach(item => collectTemplateVars(item, names));
+  }
+  return names;
+}
+
+function missingRequestVars(step, vars, collections) {
+  if (step.type) return [];
+
+  const collection = collections[step.collection];
+  if (!collection) return [];
+
+  const request = findRequest(collection, step.folder, step.request);
+  const names = collectTemplateVars(request);
+  collectTemplateVars(step.body_override, names);
+
+  return [...names].filter(name => vars[name] === undefined || vars[name] === null || vars[name] === '');
+}
+
 function findRequest(collection, folderName, requestName) {
   const folder = collection.item.find(i => i.name === folderName && Array.isArray(i.item));
   if (!folder) throw new Error(`Folder "${folderName}" not found in collection "${collection.info.name}"`);
@@ -154,10 +178,13 @@ function promptUser(question) {
 }
 
 async function runHumanInputStep(step, vars) {
-  const { prompt, store } = step;
+  const { prompt, store, equals } = step;
   if (!store) throw new Error('human-input step requires a "store" variable name');
   const message = resolveVars(prompt || `Enter value for ${store}`, vars);
   const value = await promptUser(message);
+  if (equals !== undefined && value !== resolveVars(String(equals), vars)) {
+    throw new Error(`human-input value for "${store}" did not match expected value`);
+  }
   vars[store] = value;
   console.log(`     ${store} = ${value}`);
   return { passed: 1, failed: 0 };
@@ -272,6 +299,14 @@ async function runPhase(steps, vars, collections, stopOnFailure) {
     process.stdout.write(`\n  ▶ ${label}\n`);
 
     const allowFailure = step.allow_failure === true;
+    if (allowFailure) {
+      const missingVars = missingRequestVars(step, vars, collections);
+      if (missingVars.length > 0) {
+        console.log(`     ⚠️  skipped (allow_failure) — missing variables: ${missingVars.join(', ')}`);
+        stepResults.push({ step: label, ok: true, passed: 0, failed: 0, skipped: true });
+        continue;
+      }
+    }
 
     try {
       const result = await runStep(step, vars, collections);

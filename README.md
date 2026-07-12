@@ -249,11 +249,13 @@ steps:
 ### Type: human-input
 
 ```yaml
-  - name: "Enter the received code"
-    type: human-input
-    prompt: "Type the 6-digit code received by email/SMS"
-    store: challengeCode
-```
+	  - name: "Enter the received code"
+	    type: human-input
+	    prompt: "Type the 6-digit code received by email/SMS"
+	    store: challengeCode
+	    # Optional: fail the step unless the entered value matches exactly.
+	    equals: OK
+	```
 
 ### Type: db-query
 
